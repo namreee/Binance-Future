@@ -42,7 +42,7 @@ quantity_precision_table = {
 }
 
 price_precision_table = {
-    "BTCUSDT": 2, "ETHUSDT": 2, "SANDUSDT": 4, "GOATUSDT": 4, "WLDUSDT": 4,
+    "BTCUSDT": 2, "ETHUSDT": 2, "SANDUSDT": 5, "GOATUSDT": 4, "WLDUSDT": 4,
     "RONINUSDT": 4, "IMXUSDT": 4, "COOKIEUSDT": 4, "GRIFFAINUSDT": 4,
     "PIXELUSDT": 4, "PENGUUSDT": 4, "PYTHUSDT": 4, "NEARUSDT": 4,
     "NEIROUSDT": 4, "CAKEUSDT": 4, "STXUSDT": 4, "HBARUSDT": 4,
