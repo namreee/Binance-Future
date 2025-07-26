@@ -1,0 +1,283 @@
+from flask import Flask, request
+from binance.client import Client
+from binance.enums import *
+from binance.exceptions import BinanceAPIException
+from dotenv import load_dotenv    # zaten import’lamışsın
+import os                         # zaten import’lamışsın
+import time
+import logging
+from threading import Thread
+from queue import Queue
+import pandas as pd
+import redis
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+
+# ————————————————
+# Buraya ekle:
+load_dotenv()                     # .env dosyasını oku
+api_key    = os.getenv("API_KEY")     # API Key
+api_secret = os.getenv("API_SECRET")  # API Secret
+auth_token = os.getenv("AUTH_TOKEN")  # Webhook Auth Token
+# ————————————————  
+
+# Loglama ayarları
+logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
+logger = logging.getLogger()
+
+# Binance client
+client = Client(api_key, api_secret)
+
+app = Flask(__name__)
+# … kalan kod …
+    return precision_table.get(symbol, 1)
+
+def lock_symbol(symbol):
+    return r.set(f"lock:{symbol}", "1", nx=True, ex=300)
+
+def unlock_symbol(symbol):
+    r.delete(f"lock:{symbol}")
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2), retry=retry_if_exception_type(BinanceAPIException))
+def safe_create_order(**kwargs):
+    return client.futures_create_order(**kwargs)
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2), retry=retry_if_exception_type(BinanceAPIException))
+def safe_futures_klines(**kwargs):
+    return client.futures_klines(**kwargs)
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(2), retry=retry_if_exception_type(BinanceAPIException))
+def safe_futures_mark_price(**kwargs):
+    return client.futures_mark_price(**kwargs)
+
+def close_position(symbol):
+    try:
+        positions = client.futures_position_information(symbol=symbol)
+        for pos in positions:
+            amt = float(pos["positionAmt"])
+            if amt != 0:
+                side = SIDE_SELL if amt > 0 else SIDE_BUY
+                logger.info(f"⛔ Pozisyon kapatılıyor: {side}, {abs(amt)}")
+                safe_create_order(
+                    symbol=symbol,
+                    side=side,
+                    type=ORDER_TYPE_MARKET,
+                    quantity=abs(amt)
+                )
+                time.sleep(1)
+        return True
+    except Exception as e:
+        logger.error(f"❌ Pozisyon kapatma hatası: {e}")
+        return False
+
+def verify_position(symbol, side):
+    try:
+        positions = client.futures_position_information(symbol=symbol)
+        for pos in positions:
+            amt = float(pos["positionAmt"])
+            if (side == SIDE_BUY and amt > 0) or (side == SIDE_SELL and amt < 0):
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"❌ Pozisyon kontrol hatası: {e}")
+        return False
+
+def get_ema200_trend(symbol):
+    try:
+        klines = safe_futures_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_8HOUR, limit=201)
+        closes = [float(k[4]) for k in klines]
+        series = pd.Series(closes)
+        ema200 = series.ewm(span=200, adjust=False).mean().iloc[-1]
+        last_close = closes[-1]
+        logger.info(f"EMA200: {ema200:.2f}, Son Kapanış: {last_close:.2f}")
+        return "ABOVE" if last_close > ema200 else "BELOW"
+    except Exception as e:
+        logger.error(f"❌ EMA200 hesaplama hatası: {e}")
+        return "ABOVE"
+
+def get_position_size(action, ema200_trend, timeframe):
+    size_table = {
+        "15m": {"ABOVE": {"LONG": 500, "SHORT": 300}, "BELOW": {"LONG": 300, "SHORT": 500}},
+        "30m": {"ABOVE": {"LONG": 800, "SHORT": 500}, "BELOW": {"LONG": 500, "SHORT": 800}},
+        "1h": {"ABOVE": {"LONG": 1200, "SHORT": 700}, "BELOW": {"LONG": 700, "SHORT": 1200}}
+    }
+    tf_config = size_table.get(timeframe)
+    if tf_config:
+        trend_config = tf_config.get(ema200_trend)
+        if trend_config:
+            return trend_config.get(action, 500)
+    return 500
+
+def monitor_pyramiding_bars(symbol, action, leverage, remaining_qty, entry_price, timeframe, trailing_activation, trailing_callback):
+    logger.info(f"🔍 2+3+5 bar kapanış izleme başladı ({symbol}, timeframe: {timeframe})")
+    last_checked_close_time = None
+    bars_waited = 0
+    second_buy_done = False
+
+    while bars_waited < 5 and not second_buy_done:
+        klines = safe_futures_klines(symbol=symbol, interval=timeframe, limit=2)
+        last_kline = klines[-1]
+        close_time = last_kline[6]
+
+        if close_time != last_checked_close_time:
+            bars_waited += 1
+            logger.info(f"✅ Yeni bar kapandı ({bars_waited}/5)")
+            last_checked_close_time = close_time
+
+            last_close_price = float(last_kline[4])
+            logger.info(f"🔍 {bars_waited}. bar kapanış fiyatı: {last_close_price}")
+
+            if bars_waited in [3, 5]:
+                if (action == "LONG" and last_close_price > entry_price) or (action == "SHORT" and last_close_price < entry_price):
+                    logger.info(f"🎯 {bars_waited}. bar teyidi oluştu, kalan %60 alınıyor.")
+                    side = SIDE_BUY if action == "LONG" else SIDE_SELL
+                    try:
+                        safe_create_order(
+                            symbol=symbol,
+                            side=side,
+                            type=ORDER_TYPE_MARKET,
+                            quantity=remaining_qty
+                        )
+                        second_buy_done = True
+                        logger.info(f"✅ İkinci alım yapıldı.")
+
+                        # Trailing Stop ekle
+                        positions = client.futures_position_information(symbol=symbol)
+                        total_amt = sum(abs(float(pos["positionAmt"])) for pos in positions if float(pos["positionAmt"]) != 0)
+                        activation_price = round(entry_price * (1 + trailing_activation / 100), get_precision(symbol))
+                        callback_rate = trailing_callback
+                        safe_create_order(
+                            symbol=symbol,
+                            side=SIDE_SELL if action == "LONG" else SIDE_BUY,
+                            type=ORDER_TYPE_TRAILING_STOP_MARKET,
+                            activationPrice=activation_price,
+                            callbackRate=callback_rate,
+                            quantity=total_amt,
+                            reduceOnly=True
+                        )
+                        logger.info(f"🎯 Trailing Stop eklendi: Activation {activation_price}, Callback {callback_rate}%")
+
+                        # İkinci stop-loss ekle
+                        new_half_qty = round(total_amt / 2, get_precision(symbol))
+                        first_stop_qty_str = r.get(f"{symbol}_first_stop_qty")
+                        first_stop_qty = float(first_stop_qty_str) if first_stop_qty_str else 0
+                        additional_stop_qty = round(new_half_qty - first_stop_qty, get_precision(symbol))
+
+                        if additional_stop_qty > 0:
+                            stop_loss_price = round(entry_price * 0.983, get_precision(symbol))
+                            safe_create_order(
+                                symbol=symbol,
+                                side=SIDE_SELL if action == "LONG" else SIDE_BUY,
+                                type=ORDER_TYPE_STOP_MARKET,
+                                stopPrice=stop_loss_price,
+                                quantity=additional_stop_qty,
+                                reduceOnly=True
+                            )
+                            logger.info(f"🚨 İkinci STOP-LOSS eklendi: {stop_loss_price}, Miktar: {additional_stop_qty}")
+                        else:
+                            logger.info("ℹ️ Ek stop gerekmiyor.")
+                    except Exception as e:
+                        logger.error(f"🚨 İkinci alım hatası: {e}")
+                else:
+                    logger.info(f"⛔ Teyit oluşmadı.")
+        time.sleep(30)
+
+    if not second_buy_done:
+        logger.info("⛔ 5 bar sonunda teyit yok, ikinci alım yapılmadı.")
+
+def handle_trade(data):
+    symbol = data.get("symbol", "").upper()
+    action = data.get("action", "").upper()
+    leverage = int(data.get("leverage", 10))
+    timeframe = data.get("timeframe", "15m")
+    trailing_activation = float(data.get("trailing_activation", 2.0))
+    trailing_callback = float(data.get("trailing_callback", 0.8))
+
+    ema200_trend = get_ema200_trend(symbol)
+    usdt_amount = get_position_size(action, ema200_trend, timeframe)
+
+    logger.info(f"📊 EMA200 Trend: {ema200_trend}, Pozisyon Büyüklüğü: {usdt_amount} USDT")
+
+    if not lock_symbol(symbol):
+        logger.warning(f"⚠️ {symbol} için işlem zaten yapılıyor.")
+        return
+
+    try:
+        client.futures_change_margin_type(symbol=symbol, marginType='ISOLATED')
+    except Exception as e:
+        logger.warning(f"⚠️ Marjin tipi ISOLATED veya hata: {e}")
+
+    client.futures_change_leverage(symbol=symbol, leverage=leverage)
+
+    price_info = safe_futures_mark_price(symbol=symbol)
+    price = float(price_info["markPrice"])
+    precision = get_precision(symbol)
+    first_qty = round((usdt_amount * 0.4) / price, precision)
+    remaining_qty = round((usdt_amount * 0.6) / price, precision)
+
+    close_position(symbol)
+
+    side = SIDE_BUY if action == "LONG" else SIDE_SELL
+    logger.info(f"📤 İlk %40 emir gönderiliyor.")
+
+    try:
+        safe_create_order(
+            symbol=symbol,
+            side=side,
+            type=ORDER_TYPE_MARKET,
+            quantity=first_qty
+        )
+        time.sleep(1)
+        if verify_position(symbol, side):
+            logger.info(f"✅ İlk işlem başarılı.")
+            stop_loss_price = round(price * 0.983, precision)
+            first_stop_qty = round(first_qty / 2, precision)
+            r.set(f"{symbol}_first_stop_qty", first_stop_qty)
+
+            safe_create_order(
+                symbol=symbol,
+                side=SIDE_SELL if action == "LONG" else SIDE_BUY,
+                type=ORDER_TYPE_STOP_MARKET,
+                stopPrice=stop_loss_price,
+                quantity=first_stop_qty,
+                reduceOnly=True
+            )
+            logger.info(f"🚨 İlk STOP-LOSS eklendi.")
+
+            Thread(
+                target=monitor_pyramiding_bars,
+                args=(symbol, action, leverage, remaining_qty, price, timeframe, trailing_activation, trailing_callback),
+                daemon=True
+            ).start()
+        else:
+            logger.error("❌ Pozisyon açılmadı.")
+    except Exception as e:
+        logger.error(f"🚨 Emir gönderme hatası: {e}")
+    finally:
+        unlock_symbol(symbol)
+
+def process_signals():
+    while True:
+        data = signal_queue.get()
+        if data:
+            try:
+                handle_trade(data)
+            except Exception as e:
+                logger.error(f"🚨 İşlem işleme hatası: {e}")
+        signal_queue.task_done()
+
+for _ in range(4):
+    Thread(target=process_signals, daemon=True).start()
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json()
+    logger.info(f"📩 Webhook geldi: {data}")  # Burada webhook içeriği loglanıyor.
+    if not data or data.get("auth") != auth_token:
+        logger.warning("❌ Yetkisiz erişim.")
+        return "❌ Unauthorized", 403
+    signal_queue.put(data)
+    return "✅ Kuyruğa alındı", 200
+
+if __name__ == '__main__':
+    logger.info("🚀 Bot başlatılıyor...")
+    app.run(host="0.0.0.0", port=5050)

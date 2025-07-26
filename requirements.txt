@@ -1,0 +1,10 @@
+flask
+python-binance
+ccxt
+cryptography
+pandas
+tenacity
+python-dotenv
+redis
+gspread
+oauth2client
